@@ -1,4 +1,4 @@
-# 🦊 SnowFox OS Console Launcher
+# 🦊 SnowFoxOS Console Launcher
 
 A sleek, lightweight, and hardware-accelerated game launcher written in **Go (Golang)** using the **Gio UI** library. It is designed to act as a unified gaming hub for **SnowFoxOS**, blending perfectly with the system's consistent **SnowFox-Theme (v2.2)** design language.
 
