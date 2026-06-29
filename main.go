@@ -300,6 +300,7 @@ const (
 	OverlayNone    OverlayMode = iota
 	OverlayIngame              // Xbox-Taste während Spiel läuft
 	OverlayLaunch              // Bestätigung vor dem Start
+	OverlaySystem              // Xbox-Taste ohne laufendes Spiel → System-Menü
 )
 
 type LauncherState struct {
@@ -544,6 +545,24 @@ func (s *LauncherState) terminateGame() {
 	s.terminateRequested = true
 }
 
+// runVisible führt einen Befehl aus und gibt ihn mit Ausgabe in die Konsole
+func runVisible(name string, args ...string) {
+	fullCmd := name
+	for _, a := range args {
+		fullCmd += " " + a
+	}
+	log.Printf("[SnowFox] $ %s", fullCmd)
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("[SnowFox] FEHLER bei '%s': %v", fullCmd, err)
+	} else {
+		log.Printf("[SnowFox] OK: '%s'", fullCmd)
+	}
+}
+
 func (s *LauncherState) handleInput(cmd string, w *app.Window) {
 	switch s.overlay {
 
@@ -589,19 +608,81 @@ func (s *LauncherState) handleInput(cmd string, w *app.Window) {
 			s.overlay = OverlayNone
 		}
 
+	case OverlaySystem:
+		// 4 Optionen: 0=Desktop, 1=Server, 2=Neustart, 3=Herunterfahren
+		switch cmd {
+		case "UP":
+			if s.overlaySelection > 0 {
+				s.overlaySelection--
+			}
+		case "DOWN":
+			if s.overlaySelection < 3 {
+				s.overlaySelection++
+			}
+		case "ENTER":
+			s.overlay = OverlayNone
+			w.Invalidate()
+			switch s.overlaySelection {
+			case 0:
+				s.music.stop()
+				go func() {
+					// Erst Spiel auf WS9 schließen (falls vorhanden)
+					runVisible("i3-msg", "[workspace=9]", "kill")
+					runVisible("i3-msg", "workspace", "1")
+					time.Sleep(300 * time.Millisecond)
+					runVisible("snowfox", "node", "desktop")
+					// Launcher selbst beenden
+					os.Exit(0)
+				}()
+			case 1:
+				s.music.stop()
+				go func() {
+					runVisible("i3-msg", "[workspace=9]", "kill")
+					runVisible("i3-msg", "workspace", "1")
+					time.Sleep(300 * time.Millisecond)
+					runVisible("snowfox", "node", "server")
+					os.Exit(0)
+				}()
+			case 2:
+				s.music.stop()
+				go func() {
+					runVisible("i3-msg", "[workspace=9]", "kill")
+					runVisible("i3-msg", "workspace", "1")
+					time.Sleep(300 * time.Millisecond)
+					runVisible("systemctl", "reboot")
+				}()
+			case 3:
+				s.music.stop()
+				go func() {
+					runVisible("i3-msg", "[workspace=9]", "kill")
+					runVisible("i3-msg", "workspace", "1")
+					time.Sleep(300 * time.Millisecond)
+					runVisible("systemctl", "poweroff")
+				}()
+			}
+		case "BACK", "GUIDE":
+			s.overlay = OverlayNone
+		}
+
 	case OverlayNone:
-		// Wenn ein Spiel läuft, blockieren wir ALLE Eingaben komplett,
-		// außer die GUIDE-Taste (Xbox-Button), um das Menü zu öffnen.
+		// Spiel läuft: nur GUIDE erlaubt
 		if s.uiPaused {
 			if cmd == "GUIDE" {
-				exec.Command("i3-msg", "workspace 8").Run()
+				exec.Command("i3-msg", "workspace", "8").Run()
 				s.overlay = OverlayIngame
 				s.overlaySelection = 0
 			}
-			return // Beendet die Funktion frühzeitig -> D-Pad, LB, RB etc. werden ignoriert
+			return
 		}
 
-		// Ab hier wird Code nur ausgeführt, wenn KEIN Spiel läuft:
+		// Kein Spiel aktiv: GUIDE öffnet System-Overlay
+		if cmd == "GUIDE" {
+			s.overlay = OverlaySystem
+			s.overlaySelection = 0
+			w.Invalidate()
+			return
+		}
+
 		switch cmd {
 		case "UP":
 			s.moveFocus(0)
@@ -664,6 +745,8 @@ func platformSymbol(p string) string {
 		return "E"
 	case "gog":
 		return "G"
+	case "godot":
+		return "G"
 	case "retro":
 		return "R"
 	default:
@@ -679,6 +762,8 @@ func platformAccent(p string) color.NRGBA {
 		return hexColor(0xa8d8ea)
 	case "gog":
 		return hexColor(0xf9e2af)
+	case "godot":
+		return hexColor(0x478cbf) // Godot Blau
 	case "retro":
 		return hexColor(0xf38ba8)
 	default:
@@ -689,11 +774,14 @@ func platformAccent(p string) color.NRGBA {
 // ─── UI ───────────────────────────────────────────────────────────────────────
 
 type UI struct {
-	th        *material.Theme
-	state     *LauncherState
-	clock     string
-	list      widget.List
-	launchAnim float32 // 0→1 Ladeanimation
+	th          *material.Theme
+	state       *LauncherState
+	clock       string
+	list        widget.List
+	launchAnim  float32 // 0→1 Ladeanimation
+	focusAnim   float32 // 0→1 Fokus-Rahmen Lerp
+	spinnerAng  float32 // Spinner-Winkel
+	lastFocus   int     // letzter Fokus-Index für Änderungserkennung
 }
 
 func newUI(s *LauncherState) *UI {
@@ -731,6 +819,8 @@ func (ui *UI) layout(gtx layout.Context) layout.Dimensions {
 		ui.layoutIngameOverlay(overlayGtx)
 	case OverlayLaunch:
 		ui.layoutLaunchOverlay(overlayGtx)
+	case OverlaySystem:
+		ui.layoutSystemOverlay(overlayGtx)
 	}
 
 	// Ladebildschirm
@@ -807,8 +897,21 @@ func (ui *UI) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 
 // ─── Kategorie-Tabs ───────────────────────────────────────────────────────────
 
+// countForPlatform zählt Spiele pro Plattform
+func (ui *UI) countForPlatform(p string) int {
+	if p == "all" {
+		return len(ui.state.allGames)
+	}
+	n := 0
+	for _, g := range ui.state.allGames {
+		if g.Platform == p {
+			n++
+		}
+	}
+	return n
+}
+
 func (ui *UI) layoutCategoryTabs(gtx layout.Context) layout.Dimensions {
-	// Umhüllender Hintergrund
 	return drawRoundedRect(gtx, colorBgAlt, unit.Dp(10), func(gtx layout.Context) layout.Dimensions {
 		return layout.Inset{
 			Top: unit.Dp(4), Bottom: unit.Dp(4),
@@ -818,8 +921,9 @@ func (ui *UI) layoutCategoryTabs(gtx layout.Context) layout.Dimensions {
 			for i, p := range platforms {
 				p := p
 				active := p == ui.state.activePlatform
+				count := ui.countForPlatform(p)
 				children[i] = layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return ui.layoutTab(gtx, platformLabels[p], active)
+					return ui.layoutTab(gtx, platformLabels[p], count, active)
 				})
 			}
 			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
@@ -827,21 +931,44 @@ func (ui *UI) layoutCategoryTabs(gtx layout.Context) layout.Dimensions {
 	})
 }
 
-func (ui *UI) layoutTab(gtx layout.Context, label string, active bool) layout.Dimensions {
+func (ui *UI) layoutTab(gtx layout.Context, label string, count int, active bool) layout.Dimensions {
 	bg := color.NRGBA{} // transparent
 	fg := colorTextMuted
+	badgeBg := withAlpha(colorTextMuted, 40)
+	badgeFg := colorTextMuted
 	if active {
 		bg = colorAccentSec
 		fg = colorBgBase
+		badgeBg = withAlpha(colorBgBase, 60)
+		badgeFg = colorBgBase
 	}
 	return layout.Inset{Left: unit.Dp(2), Right: unit.Dp(2)}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
 			return drawRoundedRect(gtx, bg, unit.Dp(7), func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{
 					Top: unit.Dp(7), Bottom: unit.Dp(7),
-					Left: unit.Dp(16), Right: unit.Dp(16),
+					Left: unit.Dp(14), Right: unit.Dp(10),
 				}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return ui.label(gtx, label, fg, unit.Sp(12), active)
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return ui.label(gtx, label, fg, unit.Sp(12), active)
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							if count == 0 {
+								return layout.Dimensions{}
+							}
+							return layout.Inset{Left: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return drawPill(gtx, badgeBg, func(gtx layout.Context) layout.Dimensions {
+									return layout.Inset{
+										Top: unit.Dp(1), Bottom: unit.Dp(1),
+										Left: unit.Dp(5), Right: unit.Dp(5),
+									}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										return ui.label(gtx, fmt.Sprintf("%d", count), badgeFg, unit.Sp(10), true)
+									})
+								})
+							})
+						}),
+					)
 				})
 			})
 		},
@@ -890,7 +1017,7 @@ func (ui *UI) layoutGrid(gtx layout.Context, cols int) layout.Dimensions {
 
 	if total == 0 {
 		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return ui.label(gtx, "Keine Spiele in dieser Kategorie", colorTextMuted, unit.Sp(15), false)
+			return ui.layoutEmptyState(gtx, ui.state.activePlatform)
 		})
 	}
 
@@ -920,6 +1047,192 @@ func (ui *UI) layoutGrid(gtx layout.Context, cols int) layout.Dimensions {
 	return layout.Dimensions{Size: gtx.Constraints.Max}
 }
 
+// ─── Leerer Zustand ───────────────────────────────────────────────────────────
+
+func (ui *UI) layoutEmptyState(gtx layout.Context, platform string) layout.Dimensions {
+	gtx.Constraints.Max.X = gtx.Dp(unit.Dp(480))
+	gtx.Constraints.Min.X = gtx.Dp(unit.Dp(480))
+
+	accent := platformAccent(platform)
+
+	return drawRoundedRect(gtx, colorBgAlt, unit.Dp(20), func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{
+			Top: unit.Dp(40), Bottom: unit.Dp(40),
+			Left: unit.Dp(40), Right: unit.Dp(40),
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+
+				// Großes Platform-Symbol
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					sz := gtx.Dp(unit.Dp(56))
+					paint.FillShape(gtx.Ops, withAlpha(accent, 30),
+						clip.RRect{
+							Rect: image.Rectangle{Max: image.Pt(sz, sz)},
+							NW: sz / 4, NE: sz / 4, SW: sz / 4, SE: sz / 4,
+						}.Op(gtx.Ops))
+					// Symbol zentriert im Quadrat
+					offset := op.Offset(image.Pt(sz/4, 4)).Push(gtx.Ops)
+					l := material.Label(ui.th, unit.Sp(28), platformSymbol(platform))
+					l.Color = accent
+					l.Font.Weight = font.Bold
+					l.Layout(gtx)
+					offset.Pop()
+					return layout.Dimensions{Size: image.Pt(sz, sz)}
+				}),
+
+				// Titel
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: unit.Dp(20)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						title := ui.emptyStateTitle(platform)
+						return ui.label(gtx, title, colorTextPrim, unit.Sp(18), true)
+					})
+				}),
+
+				// Beschreibung
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						desc := ui.emptyStateDesc(platform)
+						l := material.Label(ui.th, unit.Sp(13), desc)
+						l.Color = colorTextMuted
+						l.Alignment = text.Middle
+						return l.Layout(gtx)
+					})
+				}),
+
+				// Divider
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: unit.Dp(24), Bottom: unit.Dp(24)}.Layout(gtx, ui.layoutDivider)
+				}),
+
+				// Setup-Schritte
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return ui.layoutEmptyStateSteps(gtx, platform, accent)
+				}),
+			)
+		})
+	})
+}
+
+func (ui *UI) emptyStateTitle(platform string) string {
+	switch platform {
+	case "epic":
+		return "Epic Games nicht verbunden"
+	case "gog":
+		return "GOG nicht verbunden"
+	case "godot":
+		return "Keine Godot-Spiele gefunden"
+	case "retro":
+		return "Keine ROMs gefunden"
+	default:
+		return "Keine Spiele gefunden"
+	}
+}
+
+func (ui *UI) emptyStateDesc(platform string) string {
+	switch platform {
+	case "epic":
+		return "Legendary CLI installieren und anmelden,\num Epic Games-Bibliothek zu laden"
+	case "gog":
+		return "Comet CLI installieren und anmelden,\num GOG-Bibliothek zu laden"
+	case "godot":
+		return "Godot-Spiele als .x86_64 Binary\nin games.json eintragen"
+	case "retro":
+		return "ROM-Dateien in games.json\nmit platform: retro eintragen"
+	default:
+		return "Spiele in games.json eintragen"
+	}
+}
+
+func (ui *UI) layoutEmptyStateSteps(gtx layout.Context, platform string, accent color.NRGBA) layout.Dimensions {
+	type step struct {
+		num  string
+		text string
+		cmd  string
+	}
+
+	var steps []step
+	switch platform {
+	case "epic":
+		steps = []step{
+			{"1", "Legendary installieren", "pip3 install legendary-gl"},
+			{"2", "Bei Epic anmelden", "legendary auth"},
+			{"3", "Spiele synchronisieren", "legendary list"},
+			{"4", "Launcher neu starten", "snowfox node console"},
+		}
+	case "gog":
+		steps = []step{
+			{"1", "Comet herunterladen", "github.com/nicohman/comet"},
+			{"2", "Bei GOG anmelden", "comet auth"},
+			{"3", "Bibliothek laden", "comet list"},
+			{"4", "Launcher neu starten", "snowfox node console"},
+		}
+	case "godot":
+		steps = []step{
+			{"1", "Spiel exportieren", "Godot → Export → Linux/X11"},
+			{"2", "Binary ausführbar machen", "chmod +x spiel.x86_64"},
+			{"3", "In games.json eintragen", `"platform": "godot"`},
+			{"4", "Launcher neu starten", "snowfox node console"},
+		}
+	default:
+		return layout.Dimensions{}
+	}
+
+	children := make([]layout.FlexChild, len(steps))
+	for i, s := range steps {
+		s := s
+		i := i
+		children[i] = layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			pad := unit.Dp(0)
+			if i > 0 {
+				pad = unit.Dp(10)
+			}
+			return layout.Inset{Top: pad}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					// Nummer
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						sz := gtx.Dp(unit.Dp(22))
+						paint.FillShape(gtx.Ops, withAlpha(accent, 40),
+							clip.RRect{
+								Rect: image.Rectangle{Max: image.Pt(sz, sz)},
+								NW: sz / 2, NE: sz / 2, SW: sz / 2, SE: sz / 2,
+							}.Op(gtx.Ops))
+						offset := op.Offset(image.Pt(sz/4, 3)).Push(gtx.Ops)
+						l := material.Label(ui.th, unit.Sp(11), s.num)
+						l.Color = accent
+						l.Font.Weight = font.Bold
+						l.Layout(gtx)
+						offset.Pop()
+						return layout.Dimensions{Size: image.Pt(sz, sz)}
+					}),
+					// Text + Befehl
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Left: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return ui.label(gtx, s.text, colorTextPrim, unit.Sp(12), false)
+								}),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return layout.Inset{Top: unit.Dp(2)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										return drawRoundedRect(gtx, withAlpha(accent, 15), unit.Dp(4), func(gtx layout.Context) layout.Dimensions {
+											return layout.Inset{
+												Top: unit.Dp(2), Bottom: unit.Dp(2),
+												Left: unit.Dp(6), Right: unit.Dp(6),
+											}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+												return ui.label(gtx, s.cmd, withAlpha(accent, 220), unit.Sp(10), true)
+											})
+										})
+									})
+								}),
+							)
+						})
+					}),
+				)
+			})
+		})
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+}
+
 // ─── Karte ────────────────────────────────────────────────────────────────────
 
 func (ui *UI) layoutCard(gtx layout.Context, g *Game, focused bool, coverH, metaH int) layout.Dimensions {
@@ -931,11 +1244,33 @@ func (ui *UI) layoutCard(gtx layout.Context, g *Game, focused bool, coverH, meta
 	bw := gtx.Dp(unit.Dp(2))
 	rr := gtx.Dp(unit.Dp(14))
 
-	borderCol := colorBgAlt
+	// Fokus-Animation: Alpha Lerp zwischen ungefokusstem und fokussiertem Zustand
+	var borderCol color.NRGBA
 	if focused {
-		borderCol = colorFocusBorder
-		// Mache den Rahmen bei Fokus etwas dicker, um den Schatten zu ersetzen
-		bw = gtx.Dp(unit.Dp(4)) 
+		// Interpoliere focusAnim → 1.0
+		if ui.focusAnim < 1.0 {
+			ui.focusAnim += 0.08
+			if ui.focusAnim > 1.0 {
+				ui.focusAnim = 1.0
+			}
+			gtx.Execute(op.InvalidateCmd{})
+		}
+		a := uint8(float32(255) * ui.focusAnim)
+		borderCol = color.NRGBA{
+			R: uint8(float32(colorBgAlt.R) + float32(colorFocusBorder.R-colorBgAlt.R)*ui.focusAnim),
+			G: uint8(float32(colorBgAlt.G) + float32(colorFocusBorder.G-colorBgAlt.G)*ui.focusAnim),
+			B: uint8(float32(colorBgAlt.B) + float32(colorFocusBorder.B-colorBgAlt.B)*ui.focusAnim),
+			A: a,
+		}
+		borderCol = withAlpha(colorFocusBorder, uint8(80+float32(175)*ui.focusAnim))
+		bw = gtx.Dp(unit.Dp(2 + 2*ui.focusAnim))
+	} else {
+		// Beim Verlassen des Fokus: Reset
+		if ui.lastFocus != ui.state.focusIndex {
+			ui.focusAnim = 0
+			ui.lastFocus = ui.state.focusIndex
+		}
+		borderCol = colorBgAlt
 	}
 
 	// Rahmen zeichnen
@@ -1097,16 +1432,18 @@ func (ui *UI) layoutActionBar(gtx layout.Context) layout.Dimensions {
 		Top: unit.Dp(14), Bottom: unit.Dp(14),
 		Left: unit.Dp(48), Right: unit.Dp(48),
 	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		// Zeigt Controller-Hints wenn Spiel läuft, sonst Tastatur-Hints
 		hints := []struct {
 			key string
 			txt string
 			col color.NRGBA
 		}{
-			{"A", "Starten", colorAccentPrim},
-			{"LB / RB", "Plattform", colorTextMuted},
-			{"D-Pad", "Navigieren", colorTextMuted},
-			{"Guide", "Spiel-Menü", colorTextMuted},
-			{"Back", "Zurück", colorAlert},
+			{"Enter / A", "Starten", colorAccentPrim},
+			{"Q·E / Tab", "Plattform", colorTextMuted},
+			{"WASD / Pfeile", "Navigieren", colorTextMuted},
+			{"1-6", "Direkt-Auswahl", colorTextMuted},
+			{"F1 / G", "System", colorTextMuted},
+			{"Esc / B", "Zurück", colorAlert},
 		}
 		children := make([]layout.FlexChild, len(hints))
 		for i, h := range hints {
@@ -1277,22 +1614,213 @@ func (ui *UI) layoutLaunchOverlay(gtx layout.Context) layout.Dimensions {
 	})
 }
 
+// ─── System Overlay (Guide ohne Spiel) ────────────────────────────────────────
+
+func (ui *UI) layoutSystemOverlay(gtx layout.Context) layout.Dimensions {
+	s := ui.state
+
+	paint.FillShape(gtx.Ops, colorOverlayBg, clip.Rect{Max: gtx.Constraints.Max}.Op())
+
+	type sysOption struct {
+		label   string
+		sub     string
+		col     color.NRGBA
+		danger  bool
+	}
+	options := []sysOption{
+		{"Zu Desktop beenden", "snowfox node desktop", colorAccentPrim, false},
+		{"Zu Server beenden",  "snowfox node server",  colorAccentSec,  false},
+		{"Neustart",           "systemctl reboot",     colorWarning,    false},
+		{"Herunterfahren",     "systemctl poweroff",   colorAlert,      true},
+	}
+
+	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Max.X = gtx.Dp(unit.Dp(420))
+		gtx.Constraints.Min.X = gtx.Dp(unit.Dp(420))
+
+		return drawRoundedRect(gtx, colorBgAlt, unit.Dp(20), func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{
+				Top: unit.Dp(36), Bottom: unit.Dp(32),
+				Left: unit.Dp(36), Right: unit.Dp(36),
+			}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				children := make([]layout.FlexChild, 0, 10)
+
+				// Header
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								// Kleines Quadrat als Icon
+								sz := gtx.Dp(unit.Dp(10))
+								paint.FillShape(gtx.Ops, colorAccentSec,
+									clip.RRect{Rect: image.Rectangle{Max: image.Pt(sz, sz)},
+										NW: 3, NE: 3, SW: 3, SE: 3}.Op(gtx.Ops))
+								return layout.Dimensions{Size: image.Pt(sz, sz)}
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Inset{Left: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return ui.label(gtx, "SnowFox", colorTextPrim, unit.Sp(18), true)
+								})
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Inset{Left: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return ui.label(gtx, "System", colorTextMuted, unit.Sp(18), false)
+								})
+							}),
+						)
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(20), Bottom: unit.Dp(20)}.Layout(gtx, ui.layoutDivider)
+					}),
+				)
+
+				// Optionen
+				for i, opt := range options {
+					i, opt := i, opt
+					children = append(children,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							pad := unit.Dp(0)
+							if i > 0 {
+								pad = unit.Dp(8)
+							}
+							return layout.Inset{Top: pad}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								return ui.sysOverlayButton(gtx, opt.label, opt.sub, opt.col, s.overlaySelection == i)
+							})
+						}),
+					)
+				}
+
+				// Hinweis
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(24)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return ui.label(gtx, "[A] Ausführen   [B / Guide] Schließen", colorTextMuted, unit.Sp(11), false)
+						})
+					}),
+				)
+
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+			})
+		})
+	})
+}
+
+func (ui *UI) sysOverlayButton(gtx layout.Context, label, sub string, accentCol color.NRGBA, selected bool) layout.Dimensions {
+	bg := withAlpha(accentCol, 12)
+	labelCol := colorTextMuted
+	subCol := withAlpha(colorTextMuted, 120)
+	borderCol := color.NRGBA{}
+
+	if selected {
+		bg = withAlpha(accentCol, 28)
+		labelCol = accentCol
+		subCol = withAlpha(accentCol, 160)
+		borderCol = withAlpha(accentCol, 160)
+	}
+
+	bw := gtx.Dp(unit.Dp(1))
+	rr := gtx.Dp(unit.Dp(10))
+
+	macro := op.Record(gtx.Ops)
+	inner := layout.Inset{
+		Top: unit.Dp(12), Bottom: unit.Dp(12),
+		Left: unit.Dp(16), Right: unit.Dp(16),
+	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.label(gtx, label, labelCol, unit.Sp(14), selected)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: unit.Dp(3)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return ui.label(gtx, sub, subCol, unit.Sp(10), false)
+				})
+			}),
+		)
+	})
+	call := macro.Stop()
+	sz := inner.Size
+
+	if selected {
+		paint.FillShape(gtx.Ops, borderCol, clip.RRect{
+			Rect: image.Rectangle{Max: sz},
+			NW: rr, NE: rr, SW: rr, SE: rr,
+		}.Op(gtx.Ops))
+		paint.FillShape(gtx.Ops, bg, clip.RRect{
+			Rect: image.Rectangle{
+				Min: image.Pt(bw, bw),
+				Max: image.Pt(sz.X-bw, sz.Y-bw),
+			},
+			NW: rr - bw, NE: rr - bw, SW: rr - bw, SE: rr - bw,
+		}.Op(gtx.Ops))
+	} else {
+		paint.FillShape(gtx.Ops, bg, clip.RRect{
+			Rect: image.Rectangle{Max: sz},
+			NW: rr, NE: rr, SW: rr, SE: rr,
+		}.Op(gtx.Ops))
+	}
+	call.Add(gtx.Ops)
+	return inner
+}
+
 // ─── Lade-Overlay ─────────────────────────────────────────────────────────────
 
 func (ui *UI) layoutLoadingOverlay(gtx layout.Context) layout.Dimensions {
 	paint.FillShape(gtx.Ops, colorOverlayBg, clip.Rect{Max: gtx.Constraints.Max}.Op())
 
+	// Spinner-Winkel animieren
+	ui.spinnerAng += 0.06
+	if ui.spinnerAng > math.Pi*2 {
+		ui.spinnerAng -= math.Pi * 2
+	}
+	gtx.Execute(op.InvalidateCmd{})
+
 	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return ui.label(gtx, "Wird gestartet…", colorTextPrim, unit.Sp(22), true)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-					return ui.label(gtx, "Musik wird ausgeblendet", colorTextMuted, unit.Sp(13), false)
-				})
-			}),
-		)
+		return drawRoundedRect(gtx, colorBgAlt, unit.Dp(20), func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{
+				Top: unit.Dp(40), Bottom: unit.Dp(40),
+				Left: unit.Dp(56), Right: unit.Dp(56),
+			}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+
+					// Spinner
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						sz := gtx.Dp(unit.Dp(40))
+						center := image.Pt(sz/2, sz/2)
+						segments := 8
+						for i := 0; i < segments; i++ {
+							ang := float64(i)/float64(segments)*math.Pi*2 + float64(ui.spinnerAng)
+							r := float64(sz/2) - 4
+							x := int(math.Cos(ang)*r) + center.X
+							y := int(math.Sin(ang)*r) + center.Y
+							dotSz := gtx.Dp(unit.Dp(4))
+							alpha := uint8(40 + (215 * i / segments))
+							paint.FillShape(gtx.Ops, withAlpha(colorAccentPrim, alpha),
+								clip.RRect{
+									Rect: image.Rectangle{
+										Min: image.Pt(x-dotSz/2, y-dotSz/2),
+										Max: image.Pt(x+dotSz/2, y+dotSz/2),
+									},
+									NW: dotSz / 2, NE: dotSz / 2,
+									SW: dotSz / 2, SE: dotSz / 2,
+								}.Op(gtx.Ops))
+						}
+						return layout.Dimensions{Size: image.Pt(sz, sz)}
+					}),
+
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(20)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return ui.label(gtx, "Wird gestartet…", colorTextPrim, unit.Sp(18), true)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return ui.label(gtx, "Musik wird ausgeblendet", colorTextMuted, unit.Sp(12), false)
+						})
+					}),
+				)
+			})
+		})
 	})
 }
 
@@ -1586,24 +2114,74 @@ func main() {
 					}
 					if ke, ok := ev.(key.Event); ok && ke.State == key.Press {
 						switch ke.Name {
-						case key.NameUpArrow:
+						// ── Navigation ──────────────────────────
+						case key.NameUpArrow, "W":
 							state.handleInput("UP", w)
-						case key.NameDownArrow:
+						case key.NameDownArrow, "S":
 							state.handleInput("DOWN", w)
-						case key.NameLeftArrow:
+						case key.NameLeftArrow, "A":
 							state.handleInput("LEFT", w)
-						case key.NameRightArrow:
+						case key.NameRightArrow, "D":
 							state.handleInput("RIGHT", w)
-						case key.NameReturn:
+
+						// ── Bestätigen / Abbrechen ───────────────
+						case key.NameReturn, key.NameSpace:
 							state.handleInput("ENTER", w)
-						case key.NameEscape:
+						case key.NameEscape, key.NameBack:
 							state.handleInput("BACK", w)
-						case "Q":
+
+						// ── Plattform-Wechsel ────────────────────
+						// Q/E wie Controller LB/RB
+						case "Q", ",":
 							state.handleInput("LB", w)
-						case "E":
+						case "E", ".":
 							state.handleInput("RB", w)
-						case "G":
+						// Tab vorwärts, Shift+Tab rückwärts
+						case key.NameTab:
+							state.handleInput("RB", w)
+
+						// ── System-Overlay ───────────────────────
+						case "G", key.NameF1:
 							state.handleInput("GUIDE", w)
+
+						// ── Schnell-Shortcuts (nur ohne Overlay) ─
+						// Zifferntasten 1-6 für direkte Plattform-Auswahl
+						case "1":
+							if state.overlay == OverlayNone && !state.uiPaused {
+								state.activePlatform = platforms[0]
+								state.applyFilter()
+								w.Invalidate()
+							}
+						case "2":
+							if state.overlay == OverlayNone && !state.uiPaused && len(platforms) > 1 {
+								state.activePlatform = platforms[1]
+								state.applyFilter()
+								w.Invalidate()
+							}
+						case "3":
+							if state.overlay == OverlayNone && !state.uiPaused && len(platforms) > 2 {
+								state.activePlatform = platforms[2]
+								state.applyFilter()
+								w.Invalidate()
+							}
+						case "4":
+							if state.overlay == OverlayNone && !state.uiPaused && len(platforms) > 3 {
+								state.activePlatform = platforms[3]
+								state.applyFilter()
+								w.Invalidate()
+							}
+						case "5":
+							if state.overlay == OverlayNone && !state.uiPaused && len(platforms) > 4 {
+								state.activePlatform = platforms[4]
+								state.applyFilter()
+								w.Invalidate()
+							}
+						case "6":
+							if state.overlay == OverlayNone && !state.uiPaused && len(platforms) > 5 {
+								state.activePlatform = platforms[5]
+								state.applyFilter()
+								w.Invalidate()
+							}
 						}
 					}
 				}
